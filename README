@@ -1,0 +1,43 @@
+rancidd is a REST web service to manage rancid configuration remotely.
+
+
+Features:
+ * Get information on groups and nodes (devices) in rancid
+ * Add, modify or delete rancid groups and nodes
+ * Get node configuration
+ * Save node configuration from submited text value
+ * Run rancid for a given node
+ * Can encrypt .cloginrc with GPG
+
+
+Prerequisites:
+ * rancid installation
+ * NMS::Rancid perl module
+ * Arnes password server if you'd like to manage passwords in .cloginrc
+
+
+Installation:
+
+perl Makefile.pl
+make
+make install
+
+
+Usage:
+
+rancidd must run under the same user as rancid itself.
+
+Create a configuration file somewhere it can be read by rancid user. A sample
+configuration file is provided with rancidd.
+
+Start rancidd with:
+
+  rancidd --conf_file=/path/to/rancidd.conf
+
+You can test if server is running with:
+
+  wget http://localhost:10680/groups/
+
+You should have a file in your curent directory with your rancid groups in
+JSON format.
+
