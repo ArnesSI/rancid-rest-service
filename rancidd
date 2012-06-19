@@ -1,0 +1,799 @@
+#!/usr/bin/perl
+#
+
+package rancidd;
+
+use strict;
+use warnings;
+use base qw(Net::Server::HTTP);
+
+use Data::Dumper;
+use Sys::Syslog;
+use JSON::XS;
+use CGI;
+use Arnes::PasswordClient::Device;
+use NMS::Rancid;
+
+__PACKAGE__->run;
+exit;
+
+
+sub process_http_request {
+    my $self = shift;
+    my $rancid = $self->{server}->{rancid};
+    my $client_label = $self->{server}->{peeraddr}.":".$self->{server}->{peerport};
+
+    my $uri = $ENV{'PATH_INFO'} || '';
+    my $method = $ENV{'REQUEST_METHOD'} || '';
+    if ($uri =~ /[\ \;]/) {
+        return $self->send_error(400, "Malformed URL");
+    }
+    #if (!($method eq 'GET' || $method eq 'POST' || $method eq 'PUT' || $method eq 'DELETE')) {
+    if (!($method eq 'GET' || $method eq 'POST'|| $method eq 'DELETE')) {
+        return $self->send_error(501, "Request method [$method] not supported.");
+    }
+    $self->log(2, "[$client_label] $method: $uri");
+
+    # read configuration to be sure it is up to date
+    $self->setup_rancid();
+
+    # DELETE requests
+    if ($method eq 'DELETE') {
+        $self->authorize();
+        if ($uri =~ m|^/rancid/group/([^/]+)/node/([^/]+)/?$|) {
+            return $self->handle_node_delete($1, $2);
+        }
+        elsif ($uri =~ m|^/rancid/group/([^/]+)/?$|) {
+            return $self->handle_group_delete($1);
+        }
+        else {
+            return $self->send_error(404, "Not Found");
+        }
+    }
+    # POST requests
+    elsif ($method eq 'POST') {
+        $self->authorize();
+
+        # get POSTed key:values
+        my $form = {};
+        my $q = CGI->new;
+        $form->{$_} = $q->param($_) for $q->param;
+        $self->log(4,Dumper [\%ENV, $form]);
+        
+        if ($uri =~ m|node/([^/]+)/config/?$|) {
+            return $self->handle_node_config_add($1, $form);
+        }
+        elsif ($uri =~ m|node/([^/]+)/?$|) {
+            return $self->handle_node_modify($1, $form);
+        }
+        elsif ($uri =~ m|^/rancid/group/([^/]+)/node/?|) {
+            return $self->handle_node_add($1, $form);
+        }
+        elsif ($uri =~ m|^/rancid/group/?$|) {
+            return $self->handle_group_add($form);
+        }
+        else {
+            return $self->send_error(404, "Not Found");
+        }
+    }
+    # GET requests
+    elsif ($method eq 'GET') {
+        if ($uri =~ m|^/rancid/cloginrc/export/?$|) {
+            $self->handle_cloginrc_export();
+        }
+        elsif ($uri =~ m|/node/([^/]+)/config/save/?$|) {
+            $self->handle_node_config_save($1);
+        }
+        elsif ($uri =~ m|/node/([^/]+)/config/?$|) {
+            $self->handle_node_config($1);
+        }
+        elsif ($uri =~ m|^/rancid/node(/([^/]+)?)?/?$|) {
+            $self->handle_node($2);
+        }
+        elsif ($uri =~ m|^/rancid/group/([^/]+)/node(/([^/]+)?)?/?$|) {
+            $self->handle_group_node($1, $3);
+        }
+        elsif ($uri =~ m|^/rancid/group(/([^/]+)?)?/?$|) {
+            $self->handle_group($2);
+        }
+        else {
+            return $self->send_error(404, "Not Found");
+        }
+    }
+}
+
+sub default_values {
+    return {
+        host => "localhost",
+        port => 10680,
+        pid_file => "/tmp/rancidd.pid",
+
+        debug => 0,
+        background => 1,
+        log_level => 2,
+        log_file => "Sys::Syslog",
+        syslog_ident => "rancidd",
+        syslog_facility => "daemon",
+
+        password_from_stdin => 0,
+        gpg_key_uid => undef,
+        fingerprint_cmd_template => "/usr/bin/gpg --fingerprint --fingerprint <gpg_key_uid> | grep -A1 ^sub | tail -1 | sed 's/.*= //' | tr -d '[:blank:]'",
+        preset_cmd_template => "/usr/libexec/gpg-preset-passphrase --preset <gpg_key_fingerprint>",
+
+        rancid_base_path => "/opt/rancid",
+        rancid_cloginrc => $ENV{HOME}."/.cloginrc",
+    };
+}
+
+sub options {
+    my $self = shift;
+    my $prop = $self->{server};
+    my $template = shift;
+
+    # take care of options processing in parent class
+    $self->SUPER::options($template);
+
+    foreach ( qw(
+        debug
+        password_from_stdin
+        fingerprint_cmd_template
+        preset_cmd_template
+        gpg_key_uid
+        rancid_base_path
+        rancid_config_path
+        rancid_bin_path
+        rancid_cloginrc
+        ) ) {
+        $template->{$_} = \$prop->{$_};
+    }
+}
+
+sub configure_hook {
+    my $self =shift;
+    my $cmd = $self->commandline;
+    foreach (@$cmd) {
+        if (/^(--help|-h)$/) {
+            $self->display_help;
+            exit 0;
+        }
+        # we need to react on debug flag as early in startup as possible
+        if (/^--debug$/) {
+            $self->{server}->{debug} = 1;
+        }
+    }
+}
+
+# overloaded method that allows spaces in configuration file values
+### routine for loading conf file parameters
+### cache the args temporarily to handle multiple calls
+sub process_conf {
+    my $self = shift;
+    my $file = shift;
+    my $template = shift;
+    $template = undef if ! $template || ! ref($template);
+    my @args = ();
+
+    if( ! $self->{server}->{conf_file_args} ){
+        $file = ($file =~ m|^([\w\.\-\/\\\:]+)$|)
+            ? $1 : $self->fatal("Unsecure filename \"$file\"");
+
+        if( not open(_CONF,"<$file") ){
+            if (! $ENV{BOUND_SOCKETS}) {
+                warn "Couldn't open conf \"$file\" [$!]\n";
+            }
+            $self->fatal("Couldn't open conf \"$file\" [$!]");
+        }
+
+        while(<_CONF>){
+            push( @args, "$1=$2") if m/^\s*((?:--)?\w+)(?:\s*[=:]\s*|\s+)(.+)/;
+        }
+
+        close(_CONF);
+
+        $self->{server}->{conf_file_args} = \@args;
+    }
+
+    $self->process_args( $self->{server}->{conf_file_args}, $template );
+}
+
+sub post_configure {
+    my $self = shift;
+    my $server = $self->{server};
+
+    # lets tinker a bit with configuration
+    # options to make them more usable
+    $server->{background} = undef if ( $server->{debug});
+    $server->{log_file}   = undef if ( $server->{debug});
+    $server->{log_level}  = 4     if ( $server->{debug});
+    $server->{background} = undef if (!$server->{background});
+    $server->{log_file}   = undef if (!$server->{background});
+
+    $self->get_pwd_secret();
+    $self->preset_gpg_passphrase();
+    $self->setup_rancid();
+ 
+    # give a reassuring message to the user
+    print "Server starting\n";
+
+    $self->SUPER::post_configure();
+}
+
+sub post_configure_hook {
+    my $self = shift;
+    print STDERR Dumper $self if $self->{server}->{debug};
+}
+
+# timestamp all log messages
+# then call SUPER
+sub log {
+    my ($self, $level, $msg, @therest) = @_;
+    my $timestamp = $self->log_time();
+    # prevent duplicate timestamps
+    # dont timestamp if logging to syslog
+    if (!($msg =~ /^$timestamp/ ||
+          (defined $self->{server}->{log_file} && $self->{server}->{log_file} eq "Sys::Syslog")
+         )
+       ) {
+        $msg = "$timestamp $msg" unless $msg =~ /^$timestamp/;
+    }
+    $self->SUPER::log($level, $msg, @therest);
+}
+
+
+sub authorize {
+    my $self = shift;
+    $self->log(4, "Performing authorization");
+    if (! defined $ENV{HTTP_AUTH_SECRET}) {
+        $self->send_error(401, "Unauthorized");
+        exit;
+    }
+    if ($ENV{HTTP_AUTH_SECRET} ne $self->{server}->{pwd_secret}) {
+        $self->send_error(401, "Unauthorized");
+        exit;
+    }
+    $self->log(4, "Authorization successful");
+}
+
+# override method
+# server has a bug when parsing response headers
+# need to sen HTTP/1.0 response with multiple spaces
+# to work around it
+# not needed in version 2.000 and above
+sub send_status {
+    my ($self, $status, $msg) = @_;
+    $msg ||= ($status == 200) ? 'OK' : '-';
+    print "HTTP/1.0   $status    $msg\r\n";
+    print "Date: ".gmtime()." GMT\r\n";
+    print "Connection: close\r\n";
+    print "Server: ".$self->server_revision."\r\n";
+}
+
+sub send_error {
+    my ($self, $n, $msg) = @_;
+    $self->log(0, "Error processing request ($n): $msg");
+    $self->send_status($n, $msg);
+    $self->send_json(message => $msg, errcode => $n);
+    exit;
+}
+
+sub send_json {
+    my $self = shift;
+    my %args = @_;
+    my $data = $args{data} || undef;
+    my $errcode = $args{errcode} || undef;
+    my $message = $args{message} || undef;
+    my $response = {};
+    if ($errcode) {
+        $response = {
+            success => JSON::XS::false,
+            errcode => $errcode
+        };
+    }
+    else {
+        $response = { success => JSON::XS::true };
+        $response->{data} = $data if (defined $data);
+    }
+    $response->{message} = $message if (defined $message);
+
+    my $str = encode_json($response);
+    $self->log(4, "Sending json reponse: $str");
+    print "Content-type: application/json\r\n\r\n";
+    print $str;
+    $self->log(4, "Sent.");
+}
+
+
+# load gpg passphrase to gpg-agent via
+# gpg--preset-passphrase
+sub preset_gpg_passphrase {
+    my $self = shift;
+    my $server = $self->{server};
+
+    if (! defined $server->{gpg_key_uid}) {
+        $self->log(4, "No gpg_key_uid set. Not preseting passphrase.");
+        return;
+    }
+
+    $self->log(4, "Trying to preset gpg passphrase");
+    my $recipient = $server->{gpg_key_uid};
+
+    my $fingerprint_cmd = $server->{fingerprint_cmd_template};
+    $fingerprint_cmd =~ s/<gpg_key_uid>/$recipient/g;
+    $self->log(4, $fingerprint_cmd);
+    unless (open(FPRINT, "$fingerprint_cmd |")) {
+        $self->log(0, "Could not read from fingerprint command");
+        die "Could not read from fingerprint command\n";
+    }
+    my $gpg_key_fingerprint = <FPRINT>;
+    chomp $gpg_key_fingerprint;
+    close FPRINT;
+    $self->log(3, "Got GPG key fingerprint: $gpg_key_fingerprint");
+
+    my $preset_cmd = $server->{preset_cmd_template};
+    $preset_cmd =~ s/<gpg_key_fingerprint>/$gpg_key_fingerprint/;
+    $self->log(4, $preset_cmd);
+    unless (open(WRITE, "| $preset_cmd")) {
+        $self->log(0, "Could not write to preset command");
+        die "Could not write to preset command\n";
+    }
+    print WRITE $server->{pwd_secret};
+    close WRITE;
+    $self->log(3, "GPG passphrase should be set");
+}
+
+sub setup_rancid {
+    my $self = shift;
+    my $server = $self->{server};
+    
+    my $rancid = new NMS::Rancid(
+        base_path => $server->{rancid_base_path},
+        config_path => $server->{rancid_config_path},
+        bin_path => $server->{rancid_bin_path},
+        cloginrc => $server->{rancid_cloginrc},
+        encrypt_key_name => $server->{gpg_key_uid},
+        debug => $server->{debug},
+    );
+    $server->{rancid} = $rancid;
+}
+
+# get secret for password server and check if it's valid
+sub get_pwd_secret {
+    my $self = shift;
+    my $pwd_secret;
+    my $server = $self->{server};
+
+    # already set
+    if (defined $server->{pwd_secret}) {
+        return;
+    }
+
+    if (! defined $server->{password_from_stdin} || $server->{password_from_stdin} == 0) {
+        $self->log(4, "Asking user to enter pwd_secret");
+        print "Password: ";
+        $server->{pwd_secret} = read_password_from_console();
+    }
+    else {
+        $self->log(4, "Trying to read pwd_secret from stdin");
+        $server->{pwd_secret} = <STDIN>;
+        chomp $server->{pwd_secret};
+    }
+    if (! defined $server->{pwd_secret}) {
+        $self->log(0, "No password server secret defined!");
+        die "No password server secret defined!\n";
+    }
+    $self->log(4, "Testing pwd_secret at password server");
+    my $pwd = new Arnes::PasswordClient::Device();
+    $pwd->authenticate($server->{pwd_secret});
+    if ($pwd->is_error()) {
+        $self->log(0, "Authentication to password server failed: ".$pwd->get_error_string());
+        die "Authentication to password server failed: ".$pwd->get_error_string()."\n";
+    }
+    $pwd->disconnect();
+    print "Password OK\n";
+}
+
+# Turns off echo and read password from
+# <STDIN> and turns echo on again.
+sub read_password_from_console {
+    system("stty -echo");
+    my $pass = <STDIN>;
+    chomp $pass;
+    system("stty echo");
+    print "\n";
+    return $pass;
+}
+
+sub handle_cloginrc_export {
+    my $self = shift;
+    my $server = $self->{server};
+    my $rancid = $server->{rancid};
+
+    $self->log(2, "Cloginrc export requested");
+
+    my $pwd = new Arnes::PasswordClient::Device();
+    my $results = $pwd->search_passwords('.*', $server->{pwd_secret});
+    if ($pwd->is_error()) {
+        $self->send_error(500, $pwd->get_error_string());
+        return;
+    }
+    
+    my $device_data = {};
+    foreach my $router (@{$results}) {
+        chomp $router;
+        my ($hostname, $username, $pass, $epass, $group, $model) = split(/\s+/, $router);
+        $device_data->{$hostname} = {};
+        $device_data->{$hostname}->{username}  = $username;
+        $device_data->{$hostname}->{password}  = $pass;
+        $device_data->{$hostname}->{epassword} = $epass;
+        $device_data->{$hostname}->{model}     = $model;
+    }
+    
+    $rancid->exportCloginrc($device_data); # will die on failure
+
+    $self->send_json(message => "Cloginrc exported");
+}
+
+sub handle_group {
+    my $self = shift;
+    my $name = shift || undef;
+    my $rancid = $self->{server}->{rancid};
+    my $results;
+    if ($name) {
+        $results = $rancid->getGroup($name);
+    }
+    else {
+        $results = $rancid->getAllGroups();
+    }
+    if (! defined $results) {
+        return $self->send_error(404, "Requested resource not found");
+    }
+    $results = $self->clean_rancid($results);
+    $self->send_json(data => $results);
+}
+
+sub handle_group_node {
+    my $self = shift;
+    my $group_name = shift;
+    my $node_name = shift || undef;
+    my $rancid = $self->{server}->{rancid};
+    my $results;
+
+    my $group = $rancid->getGroup($group_name);
+    if (! defined $group) {
+        return $self->send_error(404, "Requested group not found");
+    }
+
+    if ($node_name) {
+        $results = $group->getNode($node_name);
+    }
+    else {
+        $results = $group->getAllNodes();
+    }
+    if (! defined $results) {
+        return $self->send_error(404, "Requested node(s) not found");
+    }
+    $results = $self->clean_rancid($results);
+    $self->send_json(data => $results);
+}
+
+sub handle_node {
+    my $self = shift;
+    my $name = shift || undef;
+    my $rancid = $self->{server}->{rancid};
+    my $results;
+
+    if ($name) {
+        $results = $rancid->getNode($name);
+    }
+    else {
+        $results = $rancid->getAllNodes();
+    }
+    if (! defined $results) {
+        return $self->send_error(404, "Requested node(s) not found");
+    }
+    $results = $self->clean_rancid($results);
+    $self->send_json(data => $results);
+}
+
+sub handle_node_config {
+    my $self = shift;
+    my $name = shift || undef;
+    my $rancid = $self->{server}->{rancid};
+    my $node;
+    my $results;
+
+    if (! defined $name) {
+        return $self->send_error(404, "Requested resource not found");
+    }
+    $node = $rancid->getNode($name);
+    if (! defined $node) {
+        return $self->send_error(404, "Requested resource not found");
+    }
+    $results = $node->getConfigText();
+    $self->send_json(data => $results);
+}
+
+sub handle_node_add {
+    my $self = shift;
+    my $group_name = shift;
+    my $data = shift;
+    my $rancid = $self->{server}->{rancid};
+
+    if (!defined $data->{name}) {
+        $self->send_error(501, "Missing node name argument in request");
+        return;
+    }
+
+    # Make sure any output is redirected to log file, not 
+    # STDOUT - that is sent to client
+    select STDERR;
+    my $group = $rancid->getGroup($group_name);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while adding new rancid node ".
+            "[".$data->{name}."]: ".$rancid->getErrorString);
+    }
+    select STDERR;
+    my $new_node = $group->addNode($data);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while adding new rancid node ".
+            "[".$data->{name}."]: ".$rancid->getErrorString);
+    }
+    $self->log(2, "Added new rancid node [".$new_node->name."]");
+
+    $new_node = $self->clean_rancid($new_node);
+    $self->send_json(data => $new_node);
+}
+
+sub handle_node_modify {
+    my $self = shift;
+    my $node_name = shift;
+    my $data = shift;
+    my $rancid = $self->{server}->{rancid};
+
+    if (!defined $node_name) {
+        $self->send_error(501, "Missing node name argument in request");
+        return;
+    }
+
+    # Make sure any output is redirected to log file, not 
+    # STDOUT - that is sent to client
+    select STDERR;
+    my $node = $rancid->getNode($node_name);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while modifying rancid node ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    select STDERR;
+    my $result = $node->modify($data);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while modifying rancid node ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    $self->log(2, "Rancid node modified [$node_name]");
+
+    $node = $self->clean_rancid($node);
+    $self->send_json(message => "Node modified", data => $node);
+}
+
+sub handle_node_delete {
+    my $self = shift;
+    my $group_name = shift || undef;
+    my $node_name = shift || undef;
+    my $rancid = $self->{server}->{rancid};
+
+    if (!defined $group_name) {
+        $self->send_error(501, "Missing group argument in request");
+        return;
+    }
+    if (!defined $node_name) {
+        $self->send_error(501, "Missing node name argument in request");
+        return;
+    }
+
+    # Make sure any output is redirected to log file, not 
+    # STDOUT - that is sent to client
+    select STDERR;
+    my $group = $rancid->getGroup($group_name);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while deleting rancid node ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    select STDERR;
+    my $result = $group->delNode($node_name);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while deleting rancid node ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    $self->log(2, "Deleted rancid node [$node_name]");
+
+    $self->send_json(message => "Node deleted");
+}
+
+sub handle_node_config_add {
+    my $self = shift;
+    my $node_name = shift;
+    my $data = shift;
+    my $rancid = $self->{server}->{rancid};
+
+    if (!defined $data->{text}) {
+        $self->send_error(501, "Missing config text argument in request");
+        return;
+    }
+
+    # Make sure any output is redirected to log file, not 
+    # STDOUT - that is sent to client
+    select STDERR;
+    my $node = $rancid->getNode($node_name);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while adding rancid node config ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    select STDERR;
+    my $result = $node->addConfigText($data);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "Error while adding rancid node config ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    $self->log(2, "Rancid node config text changed [$node_name]");
+
+    if ($result =~ /^1$/) {
+        # no changes
+        $self->send_json(message => "Node config text changed. No changes.");
+    }
+    else {
+        # we have changes
+        $self->send_json(message => "Node config text changed", data => $result);
+    }
+}
+
+sub handle_node_config_save {
+    my $self = shift;
+    my $node_name = shift;
+    my $rancid = $self->{server}->{rancid};
+
+    # Make sure any output is redirected to log file, not 
+    # STDOUT - that is sent to client
+    select STDERR;
+    my $node = $rancid->getNode($node_name);
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "While getting node info ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    select STDERR;
+    my $diff = $node->saveConfigText();
+    select STDOUT;
+    if ($rancid->isError) {
+        return $self->send_error(501, "While saving node config ".
+            "[$node_name]: ".$rancid->getErrorString);
+    }
+    $self->log(2, "Rancid node config saved [$node_name]");
+
+    if ($diff =~ /^1$/) {
+        # no changes
+        $self->send_json(message => "Node config text saved. No changes.");
+    }
+    else {
+        # we have changes
+        $self->send_json(message => "Node config text saved", data => $diff);
+    }
+}
+
+sub handle_group_add {
+    my $self = shift;
+    my $data = shift;
+    my $rancid = $self->{server}->{rancid};
+
+    if (!defined $data->{name}) {
+        $self->send_error(501, "Missing group name argument in request");
+        return;
+    }
+
+    # Make sure any output is redirected to log file, not 
+    # STDOUT - that is sent to client
+    select STDERR;
+    my $new_group = $rancid->addGroup($data->{name});
+    select STDOUT;
+    if ($rancid->isError) {
+        my $error_str = $rancid->getErrorString;
+        if (ref $new_group) {
+            $self->log(2, "Tried to add existing rancid group [".$new_group->name."]: $error_str");
+            $new_group = $self->clean_rancid($new_group);
+            $self->send_json(data => $new_group);
+            return;
+        }
+        else {
+            $self->log(1, "Error while adding new rancid group [".$data->{name}."]: $error_str");
+            $self->send_error(501, $error_str);
+            return;
+        }
+    }
+    $self->log(2, "Added new rancid group [".$new_group->name."]");
+
+    $new_group = $self->clean_rancid($new_group);
+    $self->send_json(data => $new_group);
+}
+
+sub handle_group_delete {
+    my $self = shift;
+    my $name = shift;
+    my $rancid = $self->{server}->{rancid};
+
+    # Make sure any output is redirected to log file, not 
+    # STDOUT - that is sent to client
+    select STDERR;
+    my $result = $rancid->delGroup($name);
+    select STDOUT;
+    if ($rancid->isError()) {
+        my $error_str = $rancid->getErrorString;
+        $self->log(1, "Error deleting rancid group [$name]: $error_str");
+        $self->send_error(501, $error_str);
+        return;
+    }
+    $self->log(2, "Deleted rancid group [$name]");
+
+    $self->send_json(message => "Group deleted");
+}
+
+sub clean_rancid {
+    my $self = shift;
+    my $data = shift;
+
+    if (ref $data eq 'ARRAY') {
+        foreach (@{$data}) {
+            $_ = $self->to_hash($_);
+        }
+    }
+    else {
+        $data = $self->to_hash($data);
+    }
+    return $data;
+}
+
+# convert blessed reference (object) to hash and remove any nested blessed references
+sub to_hash {
+    my $self = shift;
+    my $data = shift;
+    my %h = %{$data};
+    foreach (keys %h) {
+        my $type = ref $h{$_};
+        if ($type && !($type eq 'ARRAY' || $type eq 'HASH' || $type eq 'SCALAR')) {
+            if (${$h{$_}}->can('toString')) {
+                $h{$_} = ${$h{$_}}->toString();
+            }
+            else {
+                delete $h{$_};
+            }
+        }
+    }
+    return \%h;
+}
+
+sub display_help {
+    my $self = shift;
+    my $me = $0;
+    $me =~ s/^.*\///;
+    print <<EOT
+usage: $me [options]
+
+Rancid web service daemon.
+
+Options:
+  --conf_file=<file>           Path to configuration file.
+  --password_from_stdin=[1|0]  Read password from standard input instead of
+                               prompting the user.
+  --debug                      Run in foreground and send all log messages
+                               to stderr.
+EOT
+
+}
+
+1;
