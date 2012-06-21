@@ -16,7 +16,7 @@ use NMS::Rancid;
 
 BEGIN {
         our ($VERSION);
-        $VERSION = 0.10;
+        $VERSION = 0.11;
 }
 
 __PACKAGE__->run;
@@ -44,6 +44,7 @@ sub process_http_request {
     # DELETE requests
     if ($method eq 'DELETE') {
         $self->authorize();
+        $self->set_shell_env();
         if ($uri =~ m|^/rancid/group/([^/]+)/node/([^/]+)/?$|) {
             return $self->handle_node_delete($1, $2);
         }
@@ -63,7 +64,8 @@ sub process_http_request {
         my $q = CGI->new;
         $form->{$_} = $q->param($_) for $q->param;
         $self->log(4,Dumper [\%ENV, $form]);
-        
+        $self->set_shell_env();
+
         if ($uri =~ m|node/([^/]+)/config/?$|) {
             return $self->handle_node_config_add($1, $form);
         }
@@ -82,6 +84,7 @@ sub process_http_request {
     }
     # GET requests
     elsif ($method eq 'GET') {
+        $self->set_shell_env();
         if ($uri =~ m|^/rancid/cloginrc/export/?$|) {
             $self->handle_cloginrc_export();
         }
@@ -225,6 +228,12 @@ sub post_configure {
 sub post_configure_hook {
     my $self = shift;
     print STDERR Dumper $self if $self->{server}->{debug};
+
+    # save current enviroment
+    # %ENV is overriden in process_http_request but rancid scripts
+    # require some variables
+    my %ENV_copy = %ENV;
+    $self->{server}->{shell_env} = \%ENV_copy;
 }
 
 # timestamp all log messages
@@ -265,6 +274,7 @@ sub authorize {
 # not needed in version 2.000 and above
 sub send_status {
     my ($self, $status, $msg) = @_;
+    $self->set_server_env();
     $msg ||= ($status == 200) ? 'OK' : '-';
     print "HTTP/1.0   $status    $msg\r\n";
     print "Date: ".gmtime()." GMT\r\n";
@@ -286,6 +296,7 @@ sub send_json {
     my $data = $args{data} || undef;
     my $errcode = $args{errcode} || undef;
     my $message = $args{message} || undef;
+    $self->set_server_env();
     my $response = {};
     if ($errcode) {
         $response = {
@@ -405,6 +416,20 @@ sub read_password_from_console {
     system("stty echo");
     print "\n";
     return $pass;
+}
+
+# set %ENV as was when starting server
+sub set_shell_env {
+    my $self = shift;
+    my %ENV_server = %ENV;
+    $self->{server}->{server_env} = \%ENV_server;
+    %ENV = %{ $self->{server}->{shell_env} };
+}
+
+# set %ENV back to HTTP variables
+sub set_server_env {
+    my $self = shift;
+    %ENV = %{ $self->{server}->{server_env} };
 }
 
 sub handle_cloginrc_export {

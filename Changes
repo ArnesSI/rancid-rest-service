@@ -1,2 +1,5 @@
+0.11  Thu Jun 21 16:36:15 CEST 2012
+    - Fix problems with enviroment when calling rancid scripts
+
 0.10  Tue Jun 19 12:56:08 CEST 2012
     - First release
