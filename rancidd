@@ -124,7 +124,8 @@ sub default_values {
 
         password_from_stdin => 0,
         gpg_key_uid => undef,
-        fingerprint_cmd_template => "/usr/bin/gpg --fingerprint --fingerprint <gpg_key_uid> | grep -A1 ^sub | tail -1 | sed 's/.*= //' | tr -d '[:blank:]'",
+        gpg_decrypt_key => undef,
+        fingerprint_cmd_template => "/usr/bin/gpg --fingerprint --fingerprint <gpg_decrypt_key> | grep -A1 ^sub | tail -1 | sed 's/.*= //' | tr -d '[:blank:]'",
         preset_cmd_template => "/usr/libexec/gpg-preset-passphrase --preset <gpg_key_fingerprint>",
 
         rancid_base_path => "/opt/rancid",
@@ -146,6 +147,7 @@ sub options {
         fingerprint_cmd_template
         preset_cmd_template
         gpg_key_uid
+        gpg_decrypt_key
         rancid_base_path
         rancid_config_path
         rancid_bin_path
@@ -324,16 +326,16 @@ sub preset_gpg_passphrase {
     my $self = shift;
     my $server = $self->{server};
 
-    if (! defined $server->{gpg_key_uid}) {
-        $self->log(4, "No gpg_key_uid set. Not preseting passphrase.");
+    if (! defined $server->{gpg_decrypt_key}) {
+        $self->log(4, "No gpg_decrypt_key set. Not preseting passphrase.");
         return;
     }
 
     $self->log(4, "Trying to preset gpg passphrase");
-    my $recipient = $server->{gpg_key_uid};
+    my $recipient = $server->{gpg_decrypt_key};
 
     my $fingerprint_cmd = $server->{fingerprint_cmd_template};
-    $fingerprint_cmd =~ s/<gpg_key_uid>/$recipient/g;
+    $fingerprint_cmd =~ s/<gpg_decrypt_key>/$recipient/g;
     $self->log(4, $fingerprint_cmd);
     unless (open(FPRINT, "$fingerprint_cmd |")) {
         $self->log(0, "Could not read from fingerprint command");
@@ -365,7 +367,7 @@ sub setup_rancid {
         config_path => $server->{rancid_config_path},
         bin_path => $server->{rancid_bin_path},
         cloginrc => $server->{rancid_cloginrc},
-        encrypt_key_name => $server->{gpg_key_uid},
+        encrypt_keys => $server->{gpg_key_uid},
         debug => $server->{debug},
     );
     $server->{rancid} = $rancid;
