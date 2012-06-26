@@ -1,3 +1,5 @@
+0.12  Tue Jun 26 08:36:11 CEST 2012
+    - Add support for multilpe enrcypt keys and separate decrypt key
 0.11  Thu Jun 21 16:36:15 CEST 2012
     - Fix problems with enviroment when calling rancid scripts
 
