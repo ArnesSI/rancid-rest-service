@@ -362,11 +362,13 @@ sub setup_rancid {
     my $self = shift;
     my $server = $self->{server};
     
+    my $cloginrc = $server->{rancid_cloginrc};
+    $cloginrc =~ s/\.gpg$//;
     my $rancid = new NMS::Rancid(
         base_path => $server->{rancid_base_path},
         config_path => $server->{rancid_config_path},
         bin_path => $server->{rancid_bin_path},
-        cloginrc => $server->{rancid_cloginrc},
+        cloginrc => $cloginrc,
         encrypt_keys => $server->{gpg_key_uid},
         debug => $server->{debug},
     );
